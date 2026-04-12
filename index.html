@@ -414,9 +414,11 @@ const msgBox   = document.getElementById("messages");
 const chatInput= document.getElementById("chat-input");
 const sendBtn  = document.getElementById("send-btn");
 
-chatInput.addEventListener("input", () => {
+function updateChatSendState() {
   sendBtn.disabled = !chatInput.value.trim();
-});
+}
+
+chatInput.addEventListener("input", updateChatSendState);
 
 function autoResize(el) {
   el.style.height = "auto";
@@ -450,11 +452,16 @@ function addBubble(role, text, streaming = false) {
   return b;
 }
 
-function chipSend(q) { chatInput.value = q; autoResize(chatInput); sendChat(); }
+function chipSend(q) {
+  chatInput.value = q;
+  autoResize(chatInput);
+  updateChatSendState();
+  sendChat();
+}
 
 async function sendChat() {
   const text = chatInput.value.trim();
-  if (!text || sendBtn.disabled) return;
+  if (!text) return;
 
   chatInput.value = ""; chatInput.style.height = "auto"; sendBtn.disabled = true;
   addBubble("user", text);
