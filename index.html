@@ -200,6 +200,26 @@
     }
     .live-text.active { color: #86efac; }
 
+    /* VAD countdown ring */
+    .vad-ring-wrap {
+      position: absolute;
+      width: 100px; height: 100px;
+      pointer-events: none;
+      z-index: 2;
+    }
+    .vad-ring-wrap svg {
+      width: 100%; height: 100%;
+      transform: rotate(-90deg);
+    }
+    .vad-track { fill: none; stroke: rgba(134,239,172,0.1); stroke-width: 3; }
+    .vad-progress {
+      fill: none; stroke: #86efac; stroke-width: 3;
+      stroke-linecap: round;
+      stroke-dasharray: 283;
+      stroke-dashoffset: 283;
+      transition: stroke-dashoffset 0.1s linear;
+    }
+
     /* Mic button */
     .mic-wrap { position: relative; display: flex; align-items: center; justify-content: center; margin-bottom: 14px; }
     .pulse-ring {
@@ -305,6 +325,13 @@
       <div class="live-text" id="live-text">Tap the mic and speak</div>
 
       <div class="mic-wrap" id="mic-wrap">
+        <!-- VAD countdown ring (shown while listening) -->
+        <div class="vad-ring-wrap" id="vad-ring-wrap" style="display:none;">
+          <svg viewBox="0 0 100 100">
+            <circle class="vad-track" cx="50" cy="50" r="45"/>
+            <circle class="vad-progress" id="vad-progress" cx="50" cy="50" r="45"/>
+          </svg>
+        </div>
         <div class="mic-btn idle" id="mic-btn" onclick="micAction()">🎙️</div>
       </div>
 
@@ -331,19 +358,32 @@
     <button class="chip" onclick="chipSend('Online programs')">Online programs</button>
   </div>
 
-  <p class="footer">Powered by Gemini Flash · Whisper STT · Edge-TTS</p>
+  <p class="footer">Powered by Gemini Flash · Deepgram Nova-2 · Edge-TTS</p>
 </div>
 
 <audio id="tts-audio"></audio>
 
 <script>
 // ─── State ───────────────────────────────────────────────────────────────────
-const BASE = "";  // same origin
+const BASE = "";
 let chatHistory  = [];
 let voiceHistory = [];
-let voiceState   = "idle";   // idle | listen | think | speak
+let voiceState   = "idle";
 let mediaRec     = null;
 let audioChunks  = [];
+
+// ─── VAD config ──────────────────────────────────────────────────────────────
+const VAD_SILENCE_MS      = 1500;   // stop after 1.5s of silence
+const VAD_SILENCE_THRESH  = 0.015;  // RMS below this = silence (0.0–1.0)
+const VAD_MIN_SPEECH_MS   = 400;    // ignore clips shorter than this (avoid accidental triggers)
+
+let vadAudioCtx    = null;
+let vadAnalyser    = null;
+let vadSource      = null;
+let vadInterval    = null;
+let silenceStart   = null;
+let speechDetected = false;
+let speechStarted  = false;
 
 // ─── Particles ───────────────────────────────────────────────────────────────
 (function spawnParticles() {
@@ -366,14 +406,12 @@ let audioChunks  = [];
 
 // ─── Wave bars ───────────────────────────────────────────────────────────────
 (function buildWave() {
-  const heights = [0.5, 0.9, 0.7, 1.1, 0.6, 1.0, 0.8];
   const wrap = document.getElementById("wave-bars");
-  heights.forEach((h, i) => {
+  [0.5, 0.9, 0.7, 1.1, 0.6, 1.0, 0.8].forEach(h => {
     const b = document.createElement("div");
     b.className = "wave-bar";
     b.style.height = "6px";
     b.dataset.base = h;
-    b.dataset.idx  = i;
     wrap.appendChild(b);
   });
 })();
@@ -401,30 +439,23 @@ function switchMode(m) {
   document.getElementById("btn-chat").classList.toggle("active",  m === "chat");
   document.getElementById("btn-voice").classList.toggle("active", m === "voice");
 
-  if (m === "chat" && chatHistory.length === 0) {
+  if (m === "chat" && chatHistory.length === 0)
     addBubble("bot", "Namaste 🙏 I'm Aria, your wellness guide. Ask me anything about Kumbhak therapy or our programs!");
-  }
-  if (m === "voice" && voiceHistory.length === 0) {
+  if (m === "voice" && voiceHistory.length === 0)
     addVoiceLog("bot", "Namaste! I'm Aria. Tap the mic and ask me anything about our wellness programs.");
-  }
 }
 
 // ─── CHAT ─────────────────────────────────────────────────────────────────────
-const msgBox   = document.getElementById("messages");
-const chatInput= document.getElementById("chat-input");
-const sendBtn  = document.getElementById("send-btn");
+const msgBox    = document.getElementById("messages");
+const chatInput = document.getElementById("chat-input");
+const sendBtn   = document.getElementById("send-btn");
 
-function updateChatSendState() {
-  sendBtn.disabled = !chatInput.value.trim();
-}
-
-chatInput.addEventListener("input", updateChatSendState);
+chatInput.addEventListener("input", () => { sendBtn.disabled = !chatInput.value.trim(); });
 
 function autoResize(el) {
   el.style.height = "auto";
   el.style.height = Math.min(el.scrollHeight, 110) + "px";
 }
-
 function chatKeydown(e) {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
 }
@@ -432,20 +463,15 @@ function chatKeydown(e) {
 function addBubble(role, text, streaming = false) {
   const row = document.createElement("div");
   row.className = `bubble-row ${role}`;
-
   if (role === "bot") {
     const av = document.createElement("div");
     av.className = "avatar"; av.textContent = "🌿";
     row.appendChild(av);
   }
-
   const b = document.createElement("div");
   b.className = `bubble ${role}`;
   b.textContent = text;
-  if (streaming) {
-    const c = document.createElement("span");
-    c.className = "cursor"; b.appendChild(c);
-  }
+  if (streaming) { const c = document.createElement("span"); c.className = "cursor"; b.appendChild(c); }
   row.appendChild(b);
   msgBox.appendChild(row);
   msgBox.scrollTop = msgBox.scrollHeight;
@@ -453,55 +479,38 @@ function addBubble(role, text, streaming = false) {
 }
 
 function chipSend(q) {
-  chatInput.value = q;
-  autoResize(chatInput);
-  updateChatSendState();
-  sendChat();
+  chatInput.value = q; autoResize(chatInput);
+  sendBtn.disabled = false; sendChat();
 }
 
 async function sendChat() {
   const text = chatInput.value.trim();
   if (!text) return;
-
   chatInput.value = ""; chatInput.style.height = "auto"; sendBtn.disabled = true;
   addBubble("user", text);
   chatHistory.push({ role: "user", content: text });
-
   const botBubble = addBubble("bot", "", true);
   let full = "";
-
   try {
     const res = await fetch(`${BASE}/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ messages: chatHistory, voice_mode: false }),
     });
-
     const reader = res.body.getReader();
     const dec = new TextDecoder();
-
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      const lines = dec.decode(value).split("\n").filter(l => l.startsWith("data: "));
-      for (const line of lines) {
+      for (const line of dec.decode(value).split("\n").filter(l => l.startsWith("data: "))) {
         const d = line.slice(6);
         if (d === "[DONE]") break;
-        try {
-          const { delta } = JSON.parse(d);
-          full += delta;
-          botBubble.textContent = full;
-          const c = document.createElement("span");
-          c.className = "cursor"; botBubble.appendChild(c);
-          msgBox.scrollTop = msgBox.scrollHeight;
-        } catch {}
+        try { const { delta } = JSON.parse(d); full += delta; botBubble.textContent = full; const c = document.createElement("span"); c.className = "cursor"; botBubble.appendChild(c); msgBox.scrollTop = msgBox.scrollHeight; } catch {}
       }
     }
     botBubble.textContent = full;
     chatHistory.push({ role: "assistant", content: full });
-  } catch (err) {
-    botBubble.textContent = "⚠️ Connection error. Is the server running?";
-  }
+  } catch { botBubble.textContent = "⚠️ Connection error. Is the server running?"; }
 }
 
 // ─── VOICE ────────────────────────────────────────────────────────────────────
@@ -514,68 +523,122 @@ const micWrap  = document.getElementById("mic-wrap");
 function setVoiceState(s) {
   voiceState = s;
   micBtn.className = `mic-btn ${s}`;
-
-  // Pulse rings
   micWrap.querySelectorAll(".pulse-ring").forEach(r => r.remove());
   if (s === "listen" || s === "speak") {
     for (let i = 0; i < 2; i++) {
-      const r = document.createElement("div");
-      r.className = "pulse-ring";
+      const r = document.createElement("div"); r.className = "pulse-ring";
       r.style.border = `2px solid ${s === "listen" ? "#ef4444" : "#8b5cf6"}`;
       if (i === 1) r.style.animationDelay = ".55s";
       micWrap.insertBefore(r, micBtn);
     }
   }
-
-  const icons   = { idle:"🎙️", listen:"⏹", think:"", speak:"⏸" };
-  const labels  = { idle:"Tap to speak", listen:"Listening… tap to stop", think:"Processing…", speak:"Tap to stop" };
-  micBtn.textContent = s === "think"
-    ? ""
-    : icons[s];
-
-  if (s === "think") {
-    const sp = document.createElement("div"); sp.className = "spinner";
-    micBtn.appendChild(sp);
-  }
+  const icons  = { idle:"🎙️", listen:"⏹", think:"", speak:"⏸" };
+  const labels = { idle:"Tap to speak", listen:"Listening… auto-stops on silence", think:"Processing…", speak:"Tap to interrupt" };
+  micBtn.textContent = s === "think" ? "" : icons[s];
+  if (s === "think") { const sp = document.createElement("div"); sp.className = "spinner"; micBtn.appendChild(sp); }
   micLabel.textContent = labels[s];
   liveText.className = "live-text" + (s === "listen" ? " active" : "");
+
+  // Show/hide VAD ring
+  document.getElementById("vad-ring-wrap").style.display = s === "listen" ? "block" : "none";
+  if (s !== "listen") resetVadRing();
 }
 
-function addVoiceLog(role, text) {
-  voiceHistory.push({ role: role === "user" ? "user" : "assistant", content: text });
-  const row = document.createElement("div");
-  row.className = `vlog-row ${role}`;
-  const b = document.createElement("div");
-  b.className = `vlog-bubble ${role}`;
-  b.textContent = text;
-  row.appendChild(b);
-  vLog.appendChild(row);
-  vLog.scrollTop = vLog.scrollHeight;
+// ─── VAD ring helpers ─────────────────────────────────────────────────────────
+const circumference = 2 * Math.PI * 45; // ≈ 283
+
+function setVadRing(fraction) {
+  // fraction 0 = full ring, 1 = empty (counting down)
+  const offset = circumference * fraction;
+  document.getElementById("vad-progress").style.strokeDashoffset = offset;
 }
 
-async function micAction() {
-  if (voiceState === "idle")   startRecording();
-  else if (voiceState === "listen") stopRecording();
-  else if (voiceState === "speak") {
-    // Barge-in behavior: interrupt TTS and immediately listen again.
-    stopSpeaking();
-    await startRecording();
-  }
+function resetVadRing() {
+  document.getElementById("vad-progress").style.strokeDashoffset = circumference;
 }
 
+// ─── VAD core ─────────────────────────────────────────────────────────────────
+function startVAD(stream) {
+  vadAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  vadAnalyser = vadAudioCtx.createAnalyser();
+  vadAnalyser.fftSize = 512;
+  vadSource   = vadAudioCtx.createMediaStreamSource(stream);
+  vadSource.connect(vadAnalyser);
+
+  const buf       = new Float32Array(vadAnalyser.fftSize);
+  silenceStart    = null;
+  speechDetected  = false;
+  speechStarted   = false;
+  resetVadRing();
+
+  vadInterval = setInterval(() => {
+    vadAnalyser.getFloatTimeDomainData(buf);
+
+    // RMS energy
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+    const rms = Math.sqrt(sum / buf.length);
+
+    const isSpeaking = rms > VAD_SILENCE_THRESH;
+
+    if (isSpeaking) {
+      speechStarted = true;
+      silenceStart  = null;
+      resetVadRing();
+      // Update live wave bars with real amplitude
+      document.querySelectorAll(".wave-bar").forEach(b => {
+        b.style.height = (rms * 400 + 4) + "px";
+      });
+    } else if (speechStarted) {
+      if (!silenceStart) silenceStart = Date.now();
+      const silenceElapsed = Date.now() - silenceStart;
+      const fraction = silenceElapsed / VAD_SILENCE_MS;
+      setVadRing(fraction);
+
+      if (silenceElapsed >= VAD_SILENCE_MS) {
+        // Auto-stop — but only if we actually got some speech
+        stopRecording();
+      }
+    }
+  }, 80);
+}
+
+function stopVAD() {
+  clearInterval(vadInterval);
+  vadInterval = null;
+  if (vadSource)   { try { vadSource.disconnect(); } catch {} vadSource = null; }
+  if (vadAudioCtx) { try { vadAudioCtx.close();    } catch {} vadAudioCtx = null; }
+  vadAnalyser = null;
+  silenceStart = null;
+}
+
+// ─── Recording ───────────────────────────────────────────────────────────────
 async function startRecording() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     audioChunks = [];
+
     mediaRec = new MediaRecorder(stream, { mimeType: "audio/webm" });
     mediaRec.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
     mediaRec.onstop = async () => {
       stream.getTracks().forEach(t => t.stop());
+      stopVAD();
+
+      // Discard clips that are too short (accidental taps / background noise)
+      const totalSize = audioChunks.reduce((s, c) => s + c.size, 0);
+      if (!speechStarted || totalSize < 1000) {
+        setVoiceState("idle");
+        liveText.textContent = "Couldn't hear anything. Tap to try again.";
+        return;
+      }
       await processAudio();
     };
-    mediaRec.start();
+
+    mediaRec.start(100);   // collect in 100ms chunks for timely VAD
     setVoiceState("listen");
-    liveText.textContent = "Listening…";
+    startVAD(stream);
+    liveText.textContent = "Listening… I'll auto-stop when you pause";
+
   } catch (err) {
     liveText.textContent = "⚠️ Mic access denied. Please allow microphone.";
   }
@@ -583,6 +646,19 @@ async function startRecording() {
 
 function stopRecording() {
   if (mediaRec && mediaRec.state !== "inactive") mediaRec.stop();
+}
+
+function addVoiceLog(role, text) {
+  voiceHistory.push({ role: role === "user" ? "user" : "assistant", content: text });
+  const row = document.createElement("div"); row.className = `vlog-row ${role}`;
+  const b   = document.createElement("div"); b.className = `vlog-bubble ${role}`; b.textContent = text;
+  row.appendChild(b); vLog.appendChild(row); vLog.scrollTop = vLog.scrollHeight;
+}
+
+async function micAction() {
+  if (voiceState === "idle")        startRecording();
+  else if (voiceState === "listen") stopRecording();
+  else if (voiceState === "speak")  { stopSpeaking(); await startRecording(); }
 }
 
 async function processAudio() {
@@ -595,7 +671,7 @@ async function processAudio() {
 
   try {
     // 1. STT
-    const sttRes  = await fetch(`${BASE}/transcribe`, { method: "POST", body: fd });
+    const sttRes = await fetch(`${BASE}/transcribe`, { method: "POST", body: fd });
     const { transcript } = await sttRes.json();
 
     if (!transcript) { setVoiceState("idle"); liveText.textContent = "Couldn't hear that. Try again."; return; }
@@ -605,7 +681,7 @@ async function processAudio() {
 
     // 2. LLM
     liveText.textContent = "Thinking…";
-    const llmRes  = await fetch(`${BASE}/chat/stream`, {
+    const llmRes = await fetch(`${BASE}/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ messages: voiceHistory, voice_mode: true }),
@@ -614,12 +690,10 @@ async function processAudio() {
     const reader = llmRes.body.getReader();
     const dec    = new TextDecoder();
     let reply    = "";
-
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      const lines = dec.decode(value).split("\n").filter(l => l.startsWith("data: "));
-      for (const line of lines) {
+      for (const line of dec.decode(value).split("\n").filter(l => l.startsWith("data: "))) {
         const d = line.slice(6);
         if (d === "[DONE]") break;
         try { reply += JSON.parse(d).delta; } catch {}
@@ -630,15 +704,13 @@ async function processAudio() {
 
     // 3. TTS
     liveText.textContent = "Speaking…";
-    const ttsRes = await fetch(`${BASE}/tts`, {
+    const ttsRes   = await fetch(`${BASE}/tts`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: reply }),
     });
-
     const audioBlob = await ttsRes.blob();
-    const url = URL.createObjectURL(audioBlob);
-    playAudio(url);
+    playAudio(URL.createObjectURL(audioBlob));
 
   } catch (err) {
     setVoiceState("idle");
@@ -647,60 +719,44 @@ async function processAudio() {
 }
 
 // ─── Audio player ─────────────────────────────────────────────────────────────
-const audioEl   = document.getElementById("tts-audio");
-const audioBar  = document.getElementById("audio-bar");
-const ppBtn     = document.getElementById("pp-btn");
-const progFill  = document.getElementById("progress-fill");
-const timeLabel = document.getElementById("time-label");
+const audioEl  = document.getElementById("tts-audio");
+const audioBar = document.getElementById("audio-bar");
+const ppBtn    = document.getElementById("pp-btn");
+const progFill = document.getElementById("progress-fill");
+const timeLabel= document.getElementById("time-label");
 
 audioEl.addEventListener("timeupdate", () => {
   if (!audioEl.duration) return;
-  const pct = (audioEl.currentTime / audioEl.duration) * 100;
-  progFill.style.width = pct + "%";
+  progFill.style.width = (audioEl.currentTime / audioEl.duration * 100) + "%";
   timeLabel.textContent = fmtTime(audioEl.currentTime) + " / " + fmtTime(audioEl.duration);
 });
-
 audioEl.addEventListener("ended", () => {
-  setVoiceState("idle");
-  stopWave();
-  ppBtn.textContent = "▶";
+  setVoiceState("idle"); stopWave(); ppBtn.textContent = "▶";
   liveText.textContent = "Tap the mic to continue";
   liveText.className = "live-text";
 });
 
 function fmtTime(s) {
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60).toString().padStart(2, "0");
-  return `${m}:${sec}`;
+  return `${Math.floor(s/60)}:${Math.floor(s%60).toString().padStart(2,"0")}`;
 }
-
 function playAudio(url) {
-  audioEl.src = url;
-  audioEl.play();
-  setVoiceState("speak");
-  startWave();
-  audioBar.classList.add("show");
-  ppBtn.textContent = "⏸";
+  audioEl.src = url; audioEl.play();
+  setVoiceState("speak"); startWave();
+  audioBar.classList.add("show"); ppBtn.textContent = "⏸";
   liveText.textContent = "Aria is speaking…";
 }
-
 function stopSpeaking() {
-  audioEl.pause();
-  setVoiceState("idle");
-  stopWave();
+  audioEl.pause(); setVoiceState("idle"); stopWave();
   liveText.textContent = "Tap the mic to speak";
   liveText.className = "live-text";
 }
-
 function togglePlayPause() {
   if (audioEl.paused) { audioEl.play(); ppBtn.textContent = "⏸"; startWave(); }
   else                { audioEl.pause(); ppBtn.textContent = "▶"; stopWave(); }
 }
-
 function seekAudio(e) {
   const rect = e.currentTarget.getBoundingClientRect();
-  const pct  = (e.clientX - rect.left) / rect.width;
-  audioEl.currentTime = pct * audioEl.duration;
+  audioEl.currentTime = ((e.clientX - rect.left) / rect.width) * audioEl.duration;
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────

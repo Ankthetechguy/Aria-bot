@@ -3,20 +3,21 @@ import asyncio
 import tempfile
 import json
 import re
+import httpx
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-import edge_tts
+from gtts import gTTS
+import io
 import google.generativeai as genai
-from faster_whisper import WhisperModel
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
-TTS_VOICE      = "en-US-JennyNeural"   # edge-tts voice  (warm, natural)
-WHISPER_MODEL  = "base"                # tiny / base / small  (base = best balance)
-MAX_CONTEXT_MESSAGES = 16               # keep recent context for snappy, coherent replies
+GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "YOUR_DEEPGRAM_API_KEY")
+TTS_VOICE        = "en-US-JennyNeural"   # kept for reference
+MAX_CONTEXT_MESSAGES = 16
 
 genai.configure(api_key=GEMINI_API_KEY)
 MODEL_NAME = "gemini-2.5-flash"
@@ -60,10 +61,6 @@ def _build_history(messages: list[dict]) -> list[dict]:
         )
     return history
 
-# Load faster-whisper model once at startup (no ffmpeg needed!)
-print("⏳ Loading Whisper model...")
-whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-print("✅ Whisper ready!")
 
 # ── APP ─────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Aria Wellness Bot")
@@ -85,16 +82,33 @@ async def root():
 
 @app.post("/transcribe")
 async def transcribe(audio: UploadFile = File(...)):
-    """Receive audio blob from browser → return transcript text."""
-    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
-        tmp.write(await audio.read())
-        tmp_path = tmp.name
+    """
+    Receive audio blob from browser → Deepgram Nova-2 → return transcript.
+    Falls back to empty string on error so the frontend doesn't crash.
+    """
+    audio_bytes = await audio.read()
+
     try:
-        segments, _ = whisper_model.transcribe(tmp_path, language="en", beam_size=5)
-        transcript = " ".join(seg.text for seg in segments).strip()
-        return JSONResponse({"transcript": transcript})
-    finally:
-        os.unlink(tmp_path)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&language=en",
+                headers={
+                    "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                    "Content-Type": "audio/webm",
+                },
+                content=audio_bytes,
+            )
+            response.raise_for_status()
+            result = response.json()
+            transcript = (
+                result["results"]["channels"][0]["alternatives"][0]["transcript"]
+                .strip()
+            )
+            return JSONResponse({"transcript": transcript})
+
+    except Exception as e:
+        print(f"❌ Deepgram transcription error: {e}")
+        return JSONResponse({"transcript": "", "error": str(e)}, status_code=500)
 
 
 @app.post("/chat/stream")
@@ -115,7 +129,6 @@ async def chat_stream(payload: dict):
         system += "\n\nVOICE MODE: Keep it flowing and spoken. Use 1-3 short sentences and conversational phrasing."
 
     history = _build_history(messages)
-
     user_text = messages[-1]["content"] if messages else ""
 
     def generate():
@@ -144,26 +157,47 @@ async def chat_stream(payload: dict):
 
 @app.post("/tts")
 async def text_to_speech(payload: dict):
-    """Convert text to speech using edge-tts → return mp3 bytes."""
+    """
+    Convert text → speech.
+    Primary: edge-tts (better voice quality)
+    Fallback: gTTS (reliable on all cloud hosts)
+    """
     text = payload.get("text", "").strip()
     if not text:
         return JSONResponse({"error": "No text provided"}, status_code=400)
 
-    # Clean text for TTS (remove markdown symbols)
+    # Clean markdown symbols
     text = re.sub(r"[*_`#]", "", text)
 
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-        tmp_path = tmp.name
+    # ── Try edge-tts first ──────────────────────────────────────────────────
+    try:
+        import edge_tts
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            tmp_path = tmp.name
+        communicate = edge_tts.Communicate(text, TTS_VOICE)
+        await communicate.save(tmp_path)
 
-    communicate = edge_tts.Communicate(text, TTS_VOICE)
-    await communicate.save(tmp_path)
+        def iter_edge():
+            with open(tmp_path, "rb") as f:
+                yield from f
+            os.unlink(tmp_path)
 
-    def iter_file():
-        with open(tmp_path, "rb") as f:
-            yield from f
-        os.unlink(tmp_path)
+        return StreamingResponse(iter_edge(), media_type="audio/mpeg")
 
-    return StreamingResponse(iter_file(), media_type="audio/mpeg")
+    except Exception as e:
+        print(f"⚠️  edge-tts failed ({e}), falling back to gTTS...")
+
+    # ── Fallback: gTTS ──────────────────────────────────────────────────────
+    try:
+        buf = io.BytesIO()
+        tts = gTTS(text=text, lang="en", slow=False)
+        tts.write_to_fp(buf)
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="audio/mpeg")
+
+    except Exception as e:
+        print(f"❌ gTTS also failed: {e}")
+        return JSONResponse({"error": "TTS unavailable"}, status_code=500)
 
 
 if __name__ == "__main__":
